@@ -1,43 +1,38 @@
 
 import os
-import re
 import time
 import traceback
 import requests
 
-from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 
-# ==============================
-# TELEGRAM SETTINGS
-# ==============================
+# =================================
+# SETTINGS
+# =================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-URL = "https://www.myfxbook.com/community/outlook/XAUUSD"
+MYFX_EMAIL = os.getenv("MYFXBOOK_EMAIL")
+MYFX_PASSWORD = os.getenv("MYFXBOOK_PASSWORD")
 
-if not TOKEN or not CHAT_ID:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing"
-    )
+API = "https://www.myfxbook.com/api"
+
+if not all([TOKEN, CHAT_ID, MYFX_EMAIL, MYFX_PASSWORD]):
+    raise RuntimeError("Missing environment variables")
 
 TG = f"https://api.telegram.org/bot{TOKEN}"
 
 session = requests.Session()
 
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-})
 
-
-# ==============================
-# TELEGRAM SEND MESSAGE
-# ==============================
+# =================================
+# TELEGRAM
+# =================================
 
 def send_message(text):
 
-    response = requests.post(
+    r = requests.post(
         f"{TG}/sendMessage",
         data={
             "chat_id": CHAT_ID,
@@ -46,169 +41,149 @@ def send_message(text):
         timeout=30
     )
 
-    response.raise_for_status()
+    r.raise_for_status()
 
-    result = response.json()
+    result = r.json()
 
     if not result.get("ok"):
-        raise RuntimeError(f"Telegram error: {result}")
+        raise RuntimeError(result)
 
     return result
 
 
-# ==============================
-# NUMBER CONVERSION
-# ==============================
+# =================================
+# MYFXBOOK API LOGIN
+# =================================
 
-def get_number(value):
+def myfx_login():
 
-    return float(value.replace(",", ""))
-
-
-# ==============================
-# GET BUY / SELL DATA
-# ==============================
-
-def get_action_data(text, action):
-
-    pattern = (
-        rf"\b{action}\s+"
-        rf"([\d.]+)\s*%\s+"
-        rf"([\d,]+(?:\.\d+)?)\s+"
-        rf"(?:lots?\s+)?"
-        rf"([\d,]+)\b"
+    r = session.get(
+        f"{API}/login.json",
+        params={
+            "email": MYFX_EMAIL,
+            "password": MYFX_PASSWORD
+        },
+        timeout=30
     )
 
-    match = re.search(
-        pattern,
-        text,
-        re.IGNORECASE
-    )
+    r.raise_for_status()
 
-    if not match:
+    data = r.json()
 
-        raise ValueError(
-            f"{action} data not found on Myfxbook"
+    if data.get("error"):
+        raise RuntimeError(
+            "Myfxbook login failed: " +
+            str(data.get("message"))
         )
 
-    return {
+    token = data.get("session")
 
-        "percent": float(match.group(1)),
+    if not token:
+        raise RuntimeError("Myfxbook session missing")
 
-        "lots": get_number(match.group(2)),
-
-        "positions": int(
-            match.group(3).replace(",", "")
-        )
-    }
+    return token
 
 
-# ==============================
-# GET XAUUSD SENTIMENT
-# ==============================
+# =================================
+# GET COMMUNITY OUTLOOK
+# =================================
 
 def get_xauusd_sentiment():
 
-    print("Connecting to Myfxbook...")
-
-    response = session.get(
-        URL,
-        timeout=40
-    )
-
-    response.raise_for_status()
-
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser"
-    )
-
-    page_text = soup.get_text(
-        " ",
-        strip=True
-    )
-
-    if not page_text:
-
-        raise ValueError(
-            "Myfxbook returned an empty page"
-        )
-
-    print("Myfxbook page received.")
-
-    # Try to locate the sentiment table
-
-    header = re.search(
-        r"Symbol\s+Action\s+Percentage\s+Volume\s+Positions",
-        page_text,
-        re.IGNORECASE
-    )
-
-    if header:
-
-        table_text = page_text[header.end():]
-
-        table_text = re.split(
-            r"Market Depth",
-            table_text,
-            flags=re.IGNORECASE
-        )[0]
-
-    else:
-
-        # Try searching the full page
-        table_text = page_text
+    api_session = myfx_login()
 
     try:
 
-        buy = get_action_data(
-            table_text,
-            "Long"
+        r = session.get(
+            f"{API}/get-community-outlook.json",
+            params={
+                "session": api_session
+            },
+            timeout=30
         )
 
-        sell = get_action_data(
-            table_text,
-            "Short"
-        )
+        r.raise_for_status()
 
-    except Exception as error:
+        data = r.json()
 
-        print("Myfxbook parsing failed:", error)
+        if data.get("error"):
+            raise RuntimeError(
+                "Outlook API error: " +
+                str(data.get("message"))
+            )
 
-        print(
-            "PAGE TEXT:",
-            page_text[:3000]
-        )
+        symbols = data.get("symbols", [])
 
-        raise ValueError(
-            "Myfxbook page format changed, "
-            "or the website blocked the request. "
-            + str(error)
-        )
+        gold = None
 
-    print("BUY and SELL data received.")
+        for symbol in symbols:
 
-    return buy, sell
+            name = str(
+                symbol.get("name", "")
+            ).upper().replace("/", "").replace(".", "")
+
+            if name == "XAUUSD":
+                gold = symbol
+                break
+
+        if not gold:
+
+            available = [
+                s.get("name")
+                for s in symbols
+            ]
+
+            raise ValueError(
+                "XAUUSD not found. Available symbols: " +
+                str(available)
+            )
+
+        buy = {
+            "percent": float(gold["longPercentage"]),
+            "lots": float(gold["longVolume"]),
+            "positions": int(gold["longPositions"])
+        }
+
+        sell = {
+            "percent": float(gold["shortPercentage"]),
+            "lots": float(gold["shortVolume"]),
+            "positions": int(gold["shortPositions"])
+        }
+
+        return buy, sell
+
+    finally:
+
+        try:
+
+            session.get(
+                f"{API}/logout.json",
+                params={
+                    "session": api_session
+                },
+                timeout=15
+            )
+
+        except Exception as error:
+
+            print("Logout warning:", error)
 
 
-# ==============================
+# =================================
 # MAKE REPORT
-# ==============================
+# =================================
 
 def make_report():
 
     buy, sell = get_xauusd_sentiment()
 
     if buy["lots"] > sell["lots"]:
-
         bigger = "BUY 🟢"
 
     elif sell["lots"] > buy["lots"]:
-
         bigger = "SELL 🔴"
 
     else:
-
         bigger = "EQUAL ⚖️"
 
     now = datetime.now(
@@ -220,30 +195,23 @@ def make_report():
         sell["positions"]
     )
 
-    report = (
+    return (
 
         "🦅 XAUUSD MARKET SENTIMENT\n\n"
 
         f"🕒 Time: {now} (Iraq)\n\n"
 
         "🟢 BUY / LONG\n"
-
         f"Percentage: {buy['percent']}%\n"
-
         f"Positions: {buy['positions']:,}\n"
-
         f"Volume: {buy['lots']:,.2f} lots\n\n"
 
         "🔴 SELL / SHORT\n"
-
         f"Percentage: {sell['percent']}%\n"
-
         f"Positions: {sell['positions']:,}\n"
-
         f"Volume: {sell['lots']:,.2f} lots\n\n"
 
         "📊 TOTAL POSITIONS\n"
-
         f"{total_positions:,}\n\n"
 
         f"🏆 More Volume: {bigger}\n\n"
@@ -252,12 +220,10 @@ def make_report():
 
     )
 
-    return report
 
-
-# ==============================
-# HANDLE TELEGRAM COMMANDS
-# ==============================
+# =================================
+# HANDLE COMMANDS
+# =================================
 
 def handle_message(message):
 
@@ -266,13 +232,11 @@ def handle_message(message):
     )
 
     if chat_id != str(CHAT_ID):
-
         return
 
     text = message.get("text", "").strip()
 
     if not text:
-
         return
 
     command = (
@@ -284,15 +248,10 @@ def handle_message(message):
     if command == "/start":
 
         send_message(
-
             "🦅 XAUUSD Sentiment Bot\n\n"
-
             "Welcome!\n\n"
-
-            "بۆ وەرگرتنی شیکاری بازاڕ ئەم فەرمانە بنێرە:\n\n"
-
+            "بۆ شیکاری بازاڕ ئەم فەرمانە بنێرە:\n\n"
             "/analysis"
-
         )
 
     elif command == "/analysis":
@@ -307,62 +266,39 @@ def handle_message(message):
 
             send_message(report)
 
-            print("Analysis sent successfully.")
+            print("Analysis sent successfully")
 
         except Exception as error:
 
-            print(
-                "ANALYSIS ERROR:",
-                repr(error)
-            )
+            print("ANALYSIS ERROR:", repr(error))
 
             traceback.print_exc()
 
-            try:
-
-                send_message(
-
-                    "❌ Myfxbook Error\n\n"
-
-                    f"Error: {type(error).__name__}\n\n"
-
-                    f"Details: {str(error)[:700]}\n\n"
-
-                    "تکایە Logs ـی Railway بپشکنە."
-
-                )
-
-            except Exception as send_error:
-
-                print(
-                    "Telegram send error:",
-                    repr(send_error)
-                )
+            send_message(
+                "❌ Myfxbook API Error\n\n"
+                f"{type(error).__name__}: "
+                f"{str(error)[:700]}"
+            )
 
 
-# ==============================
+# =================================
 # MAIN BOT
-# ==============================
+# =================================
 
 def main():
 
-    print("🦅 XAUUSD Sentiment Bot Started.")
+    print("🦅 XAUUSD Bot Started")
 
-    # Remove webhook before using polling
-
-    response = requests.post(
+    r = requests.post(
         f"{TG}/deleteWebhook",
         data={"drop_pending_updates": "false"},
         timeout=30
     )
 
-    response.raise_for_status()
+    r.raise_for_status()
 
-    if not response.json().get("ok"):
-
-        raise RuntimeError(
-            "Could not delete Telegram webhook"
-        )
+    if not r.json().get("ok"):
+        raise RuntimeError("Could not delete webhook")
 
     offset = None
 
@@ -376,32 +312,20 @@ def main():
             }
 
             if offset is not None:
-
                 params["offset"] = offset
 
-            response = requests.get(
-
+            r = requests.get(
                 f"{TG}/getUpdates",
-
                 params=params,
-
                 timeout=40
-
             )
 
-            response.raise_for_status()
+            r.raise_for_status()
 
-            data = response.json()
+            data = r.json()
 
             if not data.get("ok"):
-
-                print(
-                    "Telegram API error:",
-                    data
-                )
-
                 time.sleep(5)
-
                 continue
 
             for update in data.get("result", []):
@@ -413,34 +337,24 @@ def main():
                 if message:
 
                     try:
-
                         handle_message(message)
 
                     except Exception as error:
 
-                        print(
-                            "MESSAGE ERROR:",
-                            repr(error)
-                        )
-
+                        print("MESSAGE ERROR:", repr(error))
                         traceback.print_exc()
 
         except Exception as error:
 
-            print(
-                "BOT ERROR:",
-                repr(error)
-            )
-
+            print("BOT ERROR:", repr(error))
             traceback.print_exc()
 
             time.sleep(5)
 
 
-# ==============================
+# =================================
 # START
-# ==============================
+# =================================
 
 if __name__ == "__main__":
-
     main()
